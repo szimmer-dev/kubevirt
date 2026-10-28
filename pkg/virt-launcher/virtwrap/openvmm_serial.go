@@ -22,12 +22,11 @@ package virtwrap
 import (
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
-	"strconv"
 	"sync"
-	"syscall"
 	"time"
 
 	v1 "kubevirt.io/api/core/v1"
@@ -47,24 +46,22 @@ const (
 	openVMMSerialLogMaxSize    = 2 * 1024 * 1024
 	openVMMSerialLogMaxBackups = 3
 
-	openVMMSerialDialInterval       = 10 * time.Millisecond
-	openVMMSerialDialTimeout        = time.Minute
-	openVMMSerialClientWriteTimeout = 5 * time.Second
-	openVMMSerialBufferSize         = 4096
+	openVMMSerialDialInterval  = 10 * time.Millisecond
+	openVMMSerialDialWarnAfter = 30 * time.Second
+	openVMMSerialWriteTimeout  = 5 * time.Second
+	openVMMSerialLogFileMode   = 0644
 )
 
-// openVMMSerialRelay reproduces libvirt's serial console behavior on top of OpenVMM.
+// openVMMSerialRelay gives OpenVMM's COM1 the behavior of a QEMU serial chardev with a logfile.
 //
 // OpenVMM's socket serial backend serves a single client at a time and discards guest output while no client is
 // connected, so it cannot both feed a log and serve virtctl console. The relay is therefore OpenVMM's only client: it
-// appends all guest output to virt-serial0-log and fans it out to the console client attached to virt-serial0.
+// appends all guest output to virt-serial0-log and serves virt-serial0 to one console client at a time, like QEMU.
 type openVMMSerialRelay struct {
-	listener   net.Listener
-	socketPath string
-	targetPath string
-	logWriter  *rotatingFileWriter
-	done       chan struct{}
-	stopOnce   sync.Once
+	listener     net.Listener
+	writeTimeout time.Duration
+	done         chan struct{}
+	stopOnce     sync.Once
 
 	mutex  sync.Mutex
 	vmm    net.Conn
@@ -88,8 +85,9 @@ func openVMMSerialLogEnabled(vmi *v1.VirtualMachineInstance, options *cmdv1.Virt
 }
 
 // startOpenVMMSerialRelay listens on socketPath for console clients and connects to OpenVMM at targetPath once it
-// binds. Guest output is appended to logPath unless logPath is empty.
-func startOpenVMMSerialRelay(socketPath, targetPath, logPath string) (*openVMMSerialRelay, error) {
+// binds. Guest output is appended to logPath unless logPath is empty. writeTimeout bounds how long a peer that stops
+// reading can block the relay.
+func startOpenVMMSerialRelay(socketPath, targetPath, logPath string, writeTimeout time.Duration) (*openVMMSerialRelay, error) {
 	for _, path := range []string{socketPath, targetPath} {
 		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return nil, fmt.Errorf("failed to remove stale OpenVMM serial socket %s: %w", path, err)
@@ -113,219 +111,156 @@ func startOpenVMMSerialRelay(socketPath, targetPath, logPath string) (*openVMMSe
 		return nil, fmt.Errorf("failed to listen on OpenVMM serial socket %s: %w", socketPath, err)
 	}
 
-	relay := &openVMMSerialRelay{
-		listener:   listener,
-		socketPath: socketPath,
-		targetPath: targetPath,
-		logWriter:  logWriter,
-		done:       make(chan struct{}),
-	}
-	go relay.acceptClients()
-	go relay.relayGuestOutput()
+	relay := &openVMMSerialRelay{listener: listener, writeTimeout: writeTimeout, done: make(chan struct{})}
+	go relay.run(targetPath, logWriter)
 	return relay, nil
 }
 
+// Stop disconnects the console client and OpenVMM. Closing the listener also removes virt-serial0.
 func (r *openVMMSerialRelay) Stop() {
 	r.stopOnce.Do(func() {
+		r.mutex.Lock()
+		defer r.mutex.Unlock()
 		close(r.done)
 		_ = r.listener.Close()
-		if err := os.Remove(r.socketPath); err != nil && !errors.Is(err, os.ErrNotExist) {
-			log.Log.Reason(err).Warning("failed to remove OpenVMM serial socket")
-		}
-
-		r.mutex.Lock()
-		if r.client != nil {
-			_ = r.client.Close()
-			r.client = nil
-		}
-		if r.vmm != nil {
-			_ = r.vmm.Close()
-			r.vmm = nil
-		}
-		r.mutex.Unlock()
-
-		if r.logWriter != nil {
-			if err := r.logWriter.Close(); err != nil {
-				log.Log.Reason(err).Warning("failed to close OpenVMM serial console log")
+		for _, conn := range []net.Conn{r.client, r.vmm} {
+			if conn != nil {
+				_ = conn.Close()
 			}
 		}
 	})
 }
 
-func (r *openVMMSerialRelay) stopped() bool {
-	select {
-	case <-r.done:
-		return true
-	default:
-		return false
+func (r *openVMMSerialRelay) run(targetPath string, logWriter *rotatingFileWriter) {
+	var guestOutput io.Writer = r
+	if logWriter != nil {
+		defer logWriter.Close()
+		guestOutput = io.MultiWriter(logWriter, r)
 	}
+
+	vmm := r.connectToOpenVMM(targetPath)
+	if vmm == nil {
+		return
+	}
+	go r.serveConsoles(vmm)
+	_, _ = io.Copy(guestOutput, vmm)
 }
 
-// acceptClients serves one console client at a time. A new client replaces the current one so that a connection
-// virt-handler failed to clean up cannot lock out later consoles.
-func (r *openVMMSerialRelay) acceptClients() {
+// connectToOpenVMM waits for OpenVMM to bind its serial socket, returning nil if the relay is stopped first.
+func (r *openVMMSerialRelay) connectToOpenVMM(targetPath string) net.Conn {
+	warnAt := time.Now().Add(openVMMSerialDialWarnAfter)
 	for {
-		client, err := r.listener.Accept()
-		if err != nil {
-			if !errors.Is(err, net.ErrClosed) {
-				log.Log.Reason(err).Error("OpenVMM serial relay failed to accept a console connection")
-			}
-			return
-		}
-
-		r.mutex.Lock()
-		if r.stopped() {
-			r.mutex.Unlock()
-			_ = client.Close()
-			return
-		}
-		if r.client != nil {
-			_ = r.client.Close()
-		}
-		r.client = client
-		r.mutex.Unlock()
-
-		go r.relayConsoleInput(client)
-	}
-}
-
-func (r *openVMMSerialRelay) relayConsoleInput(client net.Conn) {
-	defer r.dropClient(client)
-	buffer := make([]byte, openVMMSerialBufferSize)
-	for {
-		n, err := client.Read(buffer)
-		if n > 0 {
-			r.mutex.Lock()
-			vmm := r.vmm
-			r.mutex.Unlock()
-			// Input typed before OpenVMM accepts the relay has no guest to go to, as with a disconnected serial port.
-			if vmm != nil {
-				if _, writeErr := vmm.Write(buffer[:n]); writeErr != nil {
-					log.Log.Reason(writeErr).Warning("OpenVMM serial relay failed to forward console input")
-				}
-			}
-		}
-		if err != nil {
-			return
-		}
-	}
-}
-
-func (r *openVMMSerialRelay) dropClient(client net.Conn) {
-	r.mutex.Lock()
-	if r.client == client {
-		r.client = nil
-	}
-	r.mutex.Unlock()
-	_ = client.Close()
-}
-
-func (r *openVMMSerialRelay) connectToOpenVMM() (net.Conn, error) {
-	deadline := time.Now().Add(openVMMSerialDialTimeout)
-	for {
-		conn, err := net.Dial("unix", r.targetPath)
+		conn, err := net.Dial("unix", targetPath)
 		if err == nil {
-			r.mutex.Lock()
-			defer r.mutex.Unlock()
-			if r.stopped() {
-				_ = conn.Close()
-				return nil, net.ErrClosed
+			if !r.track(&r.vmm, conn) {
+				return nil
 			}
-			r.vmm = conn
-			return conn, nil
+			return conn
 		}
-		if time.Now().After(deadline) {
-			return nil, err
+		if !warnAt.IsZero() && time.Now().After(warnAt) {
+			warnAt = time.Time{}
+			log.Log.Reason(err).Warningf("OpenVMM has not opened its serial socket %s yet; still waiting", targetPath)
 		}
 		select {
 		case <-r.done:
-			return nil, net.ErrClosed
+			return nil
 		case <-time.After(openVMMSerialDialInterval):
 		}
 	}
 }
 
-func (r *openVMMSerialRelay) relayGuestOutput() {
-	vmm, err := r.connectToOpenVMM()
-	if err != nil {
-		if !errors.Is(err, net.ErrClosed) {
-			log.Log.Reason(err).Errorf("OpenVMM serial relay failed to connect to %s", r.targetPath)
-		}
-		return
-	}
-
-	buffer := make([]byte, openVMMSerialBufferSize)
-	logFailed := false
+// serveConsoles forwards input from one console client at a time. Like a QEMU socket chardev, later clients wait in
+// the listen backlog until the current one disconnects; virt-handler closes its previous connection before dialing.
+// Unlike QEMU, input the guest stops draining for writeTimeout ends the session, so it cannot wedge later consoles.
+func (r *openVMMSerialRelay) serveConsoles(vmm net.Conn) {
 	for {
-		n, err := vmm.Read(buffer)
-		if n > 0 {
-			if r.logWriter != nil {
-				if _, logErr := r.logWriter.Write(buffer[:n]); logErr != nil && !logFailed && !r.stopped() {
-					logFailed = true
-					log.Log.Reason(logErr).Error("failed to append to OpenVMM serial console log")
-				}
-			}
-			r.writeToClient(buffer[:n])
-		}
+		client, err := r.listener.Accept()
 		if err != nil {
 			return
 		}
+		if !r.track(&r.client, client) {
+			return
+		}
+		_, _ = io.Copy(deadlineWriter{conn: vmm, timeout: r.writeTimeout}, client)
+		r.track(&r.client, nil)
+		_ = client.Close()
 	}
 }
 
-// writeToClient bounds how long a stalled console client can delay guest output, which also feeds the log.
-func (r *openVMMSerialRelay) writeToClient(data []byte) {
+// track records conn in slot so Stop can close it, and closes conn instead if the relay has already stopped.
+func (r *openVMMSerialRelay) track(slot *net.Conn, conn net.Conn) bool {
+	r.mutex.Lock()
+	defer r.mutex.Unlock()
+	select {
+	case <-r.done:
+		if conn != nil {
+			_ = conn.Close()
+		}
+		return false
+	default:
+		*slot = conn
+		return true
+	}
+}
+
+// Write sends guest output to the attached console, if any. It never fails so that a stalled or departed console
+// cannot interrupt logging; a client that cannot keep up is disconnected instead.
+func (r *openVMMSerialRelay) Write(data []byte) (int, error) {
 	r.mutex.Lock()
 	client := r.client
 	r.mutex.Unlock()
-	if client == nil {
-		return
+	if client != nil {
+		if _, err := (deadlineWriter{conn: client, timeout: r.writeTimeout}).Write(data); err != nil {
+			_ = client.Close()
+		}
 	}
-	_ = client.SetWriteDeadline(time.Now().Add(openVMMSerialClientWriteTimeout))
-	if _, err := client.Write(data); err != nil {
-		r.dropClient(client)
+	return len(data), nil
+}
+
+// deadlineWriter bounds each write so that a peer which stops reading cannot block the relay indefinitely.
+type deadlineWriter struct {
+	conn    net.Conn
+	timeout time.Duration
+}
+
+func (w deadlineWriter) Write(data []byte) (int, error) {
+	if err := w.conn.SetWriteDeadline(time.Now().Add(w.timeout)); err != nil {
+		return 0, err
 	}
+	return w.conn.Write(data)
 }
 
 // rotatingFileWriter appends to a file and rotates it like virtlogd: once the next write would exceed maxSize, path
-// is renamed to path.0, older backups shift up by one, and backups beyond maxBackups are discarded.
+// becomes path.0, older backups shift up by one, and the oldest beyond maxBackups is discarded. It is owned by a single
+// goroutine.
 type rotatingFileWriter struct {
-	mutex      sync.Mutex
 	path       string
 	maxSize    int64
 	maxBackups int
-	mode       os.FileMode
-	uid        int
-	gid        int
 	file       *os.File
 	size       int64
+	failed     bool
 }
 
 func openRotatingFileWriter(path string, maxSize int64, maxBackups int) (*rotatingFileWriter, error) {
-	writer := &rotatingFileWriter{path: path, maxSize: maxSize, maxBackups: maxBackups, mode: 0644, uid: -1, gid: -1}
+	writer := &rotatingFileWriter{path: path, maxSize: maxSize, maxBackups: maxBackups}
 	if err := writer.open(); err != nil {
 		return nil, err
-	}
-	// Recreated files keep the identity virt-launcher gave the original so the guest-console-log container can read them.
-	info, err := writer.file.Stat()
-	if err != nil {
-		_ = writer.file.Close()
-		return nil, err
-	}
-	writer.mode = info.Mode().Perm()
-	if stat, ok := info.Sys().(*syscall.Stat_t); ok {
-		writer.uid = int(stat.Uid)
-		writer.gid = int(stat.Gid)
 	}
 	return writer, nil
 }
 
+// open sets the mode explicitly because the launcher's umask may be stricter than 022, and the guest-console-log
+// container reads the log as a different user.
 func (w *rotatingFileWriter) open() error {
-	file, err := os.OpenFile(w.path, os.O_WRONLY|os.O_CREATE|os.O_APPEND, w.mode)
+	file, err := os.OpenFile(w.path, os.O_WRONLY|os.O_CREATE|os.O_APPEND, openVMMSerialLogFileMode)
 	if err != nil {
 		return err
 	}
 	info, err := file.Stat()
+	if err == nil {
+		err = file.Chmod(openVMMSerialLogFileMode)
+	}
 	if err != nil {
 		_ = file.Close()
 		return err
@@ -335,61 +270,46 @@ func (w *rotatingFileWriter) open() error {
 	return nil
 }
 
+// Write never fails so that a logging problem cannot interrupt the console. Only the first error is reported, and a
+// file lost during a failed rotation is reopened on the next write.
 func (w *rotatingFileWriter) Write(data []byte) (int, error) {
-	w.mutex.Lock()
-	defer w.mutex.Unlock()
+	var errs []error
 	if w.file == nil {
-		return 0, os.ErrClosed
+		errs = append(errs, w.open())
+	} else if w.size > 0 && w.size+int64(len(data)) > w.maxSize {
+		errs = append(errs, w.rotate())
 	}
-	if w.size > 0 && w.size+int64(len(data)) > w.maxSize {
-		if err := w.rotate(); err != nil {
-			return 0, err
-		}
+	if w.file != nil {
+		n, err := w.file.Write(data)
+		w.size += int64(n)
+		errs = append(errs, err)
 	}
-	n, err := w.file.Write(data)
-	w.size += int64(n)
-	return n, err
+	if err := errors.Join(errs...); err != nil && !w.failed {
+		w.failed = true
+		log.Log.Reason(err).Errorf("failed to append to serial console log %s", w.path)
+	}
+	return len(data), nil
 }
 
 func (w *rotatingFileWriter) rotate() error {
-	if err := w.file.Close(); err != nil {
-		log.Log.Reason(err).Warningf("failed to close %s before rotation", w.path)
-	}
+	_ = w.file.Close()
 	w.file = nil
+	var errs []error
 	for index := w.maxBackups - 1; index > 0; index-- {
-		if err := os.Rename(w.backupPath(index-1), w.backupPath(index)); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return err
+		if err := os.Rename(fmt.Sprintf("%s.%d", w.path, index-1), fmt.Sprintf("%s.%d", w.path, index)); err != nil && !errors.Is(err, os.ErrNotExist) {
+			errs = append(errs, err)
 		}
 	}
-	if w.maxBackups > 0 {
-		if err := os.Rename(w.path, w.backupPath(0)); err != nil {
-			return err
-		}
-	} else if err := os.Remove(w.path); err != nil {
-		return err
+	if err := os.Rename(w.path, w.path+".0"); err != nil {
+		errs = append(errs, err)
 	}
-	if err := w.open(); err != nil {
-		return err
-	}
-	if w.uid >= 0 {
-		if err := w.file.Chown(w.uid, w.gid); err != nil && !errors.Is(err, os.ErrPermission) {
-			log.Log.Reason(err).Warningf("failed to restore ownership of %s after rotation", w.path)
-		}
-	}
-	return nil
-}
-
-func (w *rotatingFileWriter) backupPath(index int) string {
-	return w.path + "." + strconv.Itoa(index)
+	errs = append(errs, w.open())
+	return errors.Join(errs...)
 }
 
 func (w *rotatingFileWriter) Close() error {
-	w.mutex.Lock()
-	defer w.mutex.Unlock()
 	if w.file == nil {
 		return nil
 	}
-	err := w.file.Close()
-	w.file = nil
-	return err
+	return w.file.Close()
 }
