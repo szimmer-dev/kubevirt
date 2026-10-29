@@ -27,7 +27,10 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"syscall"
 	"time"
+
+	"golang.org/x/sys/unix"
 
 	v1 "kubevirt.io/api/core/v1"
 	"kubevirt.io/client-go/log"
@@ -48,7 +51,6 @@ const (
 
 	openVMMSerialDialInterval  = 10 * time.Millisecond
 	openVMMSerialDialWarnAfter = 30 * time.Second
-	openVMMSerialWriteTimeout  = 5 * time.Second
 	openVMMSerialLogFileMode   = 0644
 )
 
@@ -58,10 +60,9 @@ const (
 // connected, so it cannot both feed a log and serve virtctl console. The relay is therefore OpenVMM's only client: it
 // appends all guest output to virt-serial0-log and serves virt-serial0 to one console client at a time, like QEMU.
 type openVMMSerialRelay struct {
-	listener     net.Listener
-	writeTimeout time.Duration
-	done         chan struct{}
-	stopOnce     sync.Once
+	listener net.Listener
+	done     chan struct{}
+	stopOnce sync.Once
 
 	mutex  sync.Mutex
 	vmm    net.Conn
@@ -85,9 +86,8 @@ func openVMMSerialLogEnabled(vmi *v1.VirtualMachineInstance, options *cmdv1.Virt
 }
 
 // startOpenVMMSerialRelay listens on socketPath for console clients and connects to OpenVMM at targetPath once it
-// binds. Guest output is appended to logPath unless logPath is empty. writeTimeout bounds how long a peer that stops
-// reading can block the relay.
-func startOpenVMMSerialRelay(socketPath, targetPath, logPath string, writeTimeout time.Duration) (*openVMMSerialRelay, error) {
+// binds. Guest output is appended to logPath unless logPath is empty.
+func startOpenVMMSerialRelay(socketPath, targetPath, logPath string) (*openVMMSerialRelay, error) {
 	for _, path := range []string{socketPath, targetPath} {
 		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return nil, fmt.Errorf("failed to remove stale OpenVMM serial socket %s: %w", path, err)
@@ -111,7 +111,7 @@ func startOpenVMMSerialRelay(socketPath, targetPath, logPath string, writeTimeou
 		return nil, fmt.Errorf("failed to listen on OpenVMM serial socket %s: %w", socketPath, err)
 	}
 
-	relay := &openVMMSerialRelay{listener: listener, writeTimeout: writeTimeout, done: make(chan struct{})}
+	relay := &openVMMSerialRelay{listener: listener, done: make(chan struct{})}
 	go relay.run(targetPath, logWriter)
 	return relay, nil
 }
@@ -171,7 +171,6 @@ func (r *openVMMSerialRelay) connectToOpenVMM(targetPath string) net.Conn {
 
 // serveConsoles forwards input from one console client at a time. Like a QEMU socket chardev, later clients wait in
 // the listen backlog until the current one disconnects; virt-handler closes its previous connection before dialing.
-// Unlike QEMU, input the guest stops draining for writeTimeout ends the session, so it cannot wedge later consoles.
 func (r *openVMMSerialRelay) serveConsoles(vmm net.Conn) {
 	for {
 		client, err := r.listener.Accept()
@@ -181,7 +180,7 @@ func (r *openVMMSerialRelay) serveConsoles(vmm net.Conn) {
 		if !r.track(&r.client, client) {
 			return
 		}
-		_, _ = io.Copy(deadlineWriter{conn: vmm, timeout: r.writeTimeout}, client)
+		_, _ = io.Copy(dropWhenFullWriter{conn: vmm}, client)
 		r.track(&r.client, nil)
 		_ = client.Close()
 	}
@@ -203,31 +202,32 @@ func (r *openVMMSerialRelay) track(slot *net.Conn, conn net.Conn) bool {
 	}
 }
 
-// Write sends guest output to the attached console, if any. It never fails so that a stalled or departed console
-// cannot interrupt logging; a client that cannot keep up is disconnected instead.
+// Write sends guest output to the attached console, if any.
 func (r *openVMMSerialRelay) Write(data []byte) (int, error) {
 	r.mutex.Lock()
 	client := r.client
 	r.mutex.Unlock()
 	if client != nil {
-		if _, err := (deadlineWriter{conn: client, timeout: r.writeTimeout}).Write(data); err != nil {
-			_ = client.Close()
-		}
+		_, _ = dropWhenFullWriter{conn: client}.Write(data)
 	}
 	return len(data), nil
 }
 
-// deadlineWriter bounds each write so that a peer which stops reading cannot block the relay indefinitely.
-type deadlineWriter struct {
-	conn    net.Conn
-	timeout time.Duration
+// dropWhenFullWriter sends only what the peer's socket buffer can take and discards the rest, so a peer that stops
+// reading never blocks the relay. Unlike QEMU, which stalls the guest's UART until the console reads again, this keeps
+// guest output flowing to the log; the stalled console loses the overflow but stays connected.
+type dropWhenFullWriter struct {
+	conn net.Conn
 }
 
-func (w deadlineWriter) Write(data []byte) (int, error) {
-	if err := w.conn.SetWriteDeadline(time.Now().Add(w.timeout)); err != nil {
-		return 0, err
+func (w dropWhenFullWriter) Write(data []byte) (int, error) {
+	if raw, err := w.conn.(syscall.Conn).SyscallConn(); err == nil {
+		_ = raw.Write(func(fd uintptr) bool {
+			_, _ = unix.SendmsgN(int(fd), data, nil, nil, unix.MSG_DONTWAIT)
+			return true
+		})
 	}
-	return w.conn.Write(data)
+	return len(data), nil
 }
 
 // rotatingFileWriter appends to a file and rotates it like virtlogd: once the next write would exceed maxSize, path

@@ -54,8 +54,8 @@ var _ = Describe("OpenVMM serial relay", func() {
 
 	// startRelay binds the fake OpenVMM COM1 listener after the relay starts, as OpenVMM does, and returns the
 	// relay's connection to it.
-	startRelay := func(p paths, logPath string, writeTimeout time.Duration) (*openVMMSerialRelay, net.Conn) {
-		relay, err := startOpenVMMSerialRelay(p.socket, p.target, logPath, writeTimeout)
+	startRelay := func(p paths, logPath string) (*openVMMSerialRelay, net.Conn) {
+		relay, err := startOpenVMMSerialRelay(p.socket, p.target, logPath)
 		Expect(err).ToNot(HaveOccurred(), "the relay should start listening for console clients")
 		DeferCleanup(relay.Stop)
 
@@ -114,7 +114,7 @@ var _ = Describe("OpenVMM serial relay", func() {
 
 	It("logs all guest output and serves one console at a time, like a QEMU serial chardev", func() {
 		p := newPaths()
-		_, vmm := startRelay(p, p.log, openVMMSerialWriteTimeout)
+		_, vmm := startRelay(p, p.log)
 
 		By("logging output while no console is attached")
 		send(vmm, "firmware\n", "the fake guest should emit serial output")
@@ -144,7 +144,7 @@ var _ = Describe("OpenVMM serial relay", func() {
 
 	It("serves the console without writing a log when serial console logging is disabled", func() {
 		p := newPaths()
-		_, vmm := startRelay(p, "", openVMMSerialWriteTimeout)
+		_, vmm := startRelay(p, "")
 
 		client := attachConsole(p, vmm, "x")
 		send(vmm, "boot\n", "the fake guest should emit serial output")
@@ -157,7 +157,7 @@ var _ = Describe("OpenVMM serial relay", func() {
 	It("stops cleanly whether or not OpenVMM has bound its serial socket", func() {
 		By("abandoning the wait for OpenVMM")
 		early := newPaths()
-		relay, err := startOpenVMMSerialRelay(early.socket, early.target, early.log, openVMMSerialWriteTimeout)
+		relay, err := startOpenVMMSerialRelay(early.socket, early.target, early.log)
 		Expect(err).ToNot(HaveOccurred(), "the relay should start before OpenVMM has bound its serial socket")
 		relay.Stop()
 		time.Sleep(5 * openVMMSerialDialInterval)
@@ -171,7 +171,7 @@ var _ = Describe("OpenVMM serial relay", func() {
 
 		By("disconnecting both sides once connected")
 		p := newPaths()
-		relay, vmm := startRelay(p, p.log, openVMMSerialWriteTimeout)
+		relay, vmm := startRelay(p, p.log)
 		client := attachConsole(p, vmm, "x")
 		relay.Stop()
 		expectEOF(client, "stopping the relay should disconnect the console client")
@@ -180,37 +180,44 @@ var _ = Describe("OpenVMM serial relay", func() {
 		Expect(err).To(MatchError(os.ErrNotExist), "stopping the relay should remove the virt-serial0 socket")
 	})
 
-	It("does not let a peer that stops reading wedge the relay", func() {
+	It("drops overflow instead of blocking when a peer stops reading", func() {
 		p := newPaths()
-		_, vmm := startRelay(p, p.log, 100*time.Millisecond)
-		// Far larger than a Unix socket buffer, so a peer that stops reading forces a write to block.
+		_, vmm := startRelay(p, p.log)
+		// Far larger than a Unix socket buffer, so a peer that stops reading cannot take all of it.
 		bulk := strings.Repeat("z", 1024*1024)
 
-		By("continuing to log when the console stops reading")
-		attachConsole(p, vmm, "x")
-		send(vmm, bulk, "the fake guest should be able to emit a large burst of output")
-		Eventually(func() int { return len(readLog(p.log)()) }).Should(Equal(len(bulk)),
-			"a console that stops reading must be dropped rather than stall logging")
-
-		By("serving the next console when the guest stops reading input")
-		stuck := dialConsole(p)
-		stuckDone := make(chan error, 1)
-		go func() {
-			_, err := stuck.Write([]byte(bulk))
-			stuckDone <- err
-		}()
-		Eventually(stuckDone, 5*time.Second).Should(Receive(HaveOccurred()),
-			"the relay should drop a console whose input the guest has stopped reading")
-		for {
-			Expect(vmm.SetReadDeadline(time.Now().Add(200*time.Millisecond))).To(Succeed(), "the fake guest should accept a read deadline")
-			if _, err := vmm.Read(make([]byte, 64*1024)); err != nil {
-				Expect(err).To(MatchError(os.ErrDeadlineExceeded), "the guest should drain the stuck input without errors")
-				break
+		drain := func(conn net.Conn) int {
+			total := 0
+			for {
+				Expect(conn.SetReadDeadline(time.Now().Add(200*time.Millisecond))).To(Succeed(), "the connection should accept a read deadline")
+				n, err := conn.Read(make([]byte, 64*1024))
+				total += n
+				if err != nil {
+					Expect(err).To(MatchError(os.ErrDeadlineExceeded), "draining should end only because no more data arrives")
+					return total
+				}
 			}
 		}
+
+		By("logging everything while the console stops reading")
+		console := attachConsole(p, vmm, "x")
+		send(vmm, bulk, "the fake guest should be able to emit a large burst of output")
+		Eventually(func() int { return len(readLog(p.log)()) }).Should(Equal(len(bulk)),
+			"a console that stops reading must not stall logging")
+
+		By("keeping the stalled console connected and dropping only what did not fit")
+		Expect(drain(console)).To(BeNumerically("<", len(bulk)), "output the stalled console could not buffer should be dropped")
+		send(vmm, "after\n", "the fake guest should emit serial output")
+		expectRead(console, "after\n", "the console should keep receiving output once it reads again")
+		Expect(console.Close()).To(Succeed(), "the console should disconnect cleanly")
+
+		By("serving the next console after one sent more input than the guest read")
+		stuck := dialConsole(p)
+		send(stuck, bulk, "unread input should be accepted rather than block the console")
+		Expect(stuck.Close()).To(Succeed(), "the console should disconnect cleanly")
+		Expect(drain(vmm)).To(BeNumerically("<", len(bulk)), "input the guest could not buffer should be dropped")
 		attachConsole(p, vmm, "next\n")
 	})
-
 	It("rotates the log like virtlogd, keeping a bounded number of readable backups", func() {
 		dir := GinkgoT().TempDir()
 		path := filepath.Join(dir, "virt-serial0-log")

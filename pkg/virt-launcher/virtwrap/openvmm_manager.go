@@ -558,7 +558,7 @@ func (l *OpenVMMDomainManager) startSerialRelayLocked(vmi *v1.VirtualMachineInst
 	if openVMMSerialLogEnabled(vmi, options) {
 		logPath = socketPath + openVMMSerialLogSuffix
 	}
-	relay, err := startOpenVMMSerialRelay(socketPath, openVMMPrivateSerialSocketPath(l.consoleDir, uid), logPath, openVMMSerialWriteTimeout)
+	relay, err := startOpenVMMSerialRelay(socketPath, openVMMPrivateSerialSocketPath(l.consoleDir, uid), logPath)
 	if err != nil {
 		return err
 	}
