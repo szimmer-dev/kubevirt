@@ -27,10 +27,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
-	"syscall"
 	"time"
-
-	"golang.org/x/sys/unix"
 
 	v1 "kubevirt.io/api/core/v1"
 	"kubevirt.io/client-go/log"
@@ -45,7 +42,8 @@ const (
 	openVMMPrivateSerialSocket = "openvmm-serial0"
 	openVMMSerialLogSuffix     = "-log"
 
-	// Match the virtlogd defaults that bound virt-serial0-log on KVM.
+	// Match the virtlogd defaults that bound virt-serial0-log on KVM (max_size and max_backups in
+	// https://github.com/libvirt/libvirt/blob/v12.8.0/src/logging/log_daemon_config.c).
 	openVMMSerialLogMaxSize    = 2 * 1024 * 1024
 	openVMMSerialLogMaxBackups = 3
 
@@ -54,7 +52,8 @@ const (
 	openVMMSerialLogFileMode   = 0644
 )
 
-// openVMMSerialRelay gives OpenVMM's COM1 the behavior of a QEMU serial chardev with a logfile.
+// openVMMSerialRelay gives OpenVMM's COM1 the behavior that KVM gets from a QEMU serial chardev with a logfile, which
+// pkg/virt-launcher/virtwrap/converter/compute/console.go configures through libvirt.
 //
 // OpenVMM's socket serial backend serves a single client at a time and discards guest output while no client is
 // connected, so it cannot both feed a log and serve virtctl console. The relay is therefore OpenVMM's only client: it
@@ -180,7 +179,7 @@ func (r *openVMMSerialRelay) serveConsoles(vmm net.Conn) {
 		if !r.track(&r.client, client) {
 			return
 		}
-		_, _ = io.Copy(dropWhenFullWriter{conn: vmm}, client)
+		_, _ = io.Copy(vmm, client)
 		r.track(&r.client, nil)
 		_ = client.Close()
 	}
@@ -202,30 +201,16 @@ func (r *openVMMSerialRelay) track(slot *net.Conn, conn net.Conn) bool {
 	}
 }
 
-// Write sends guest output to the attached console, if any.
+// Write sends guest output to the attached console, if any. As with KVM, a console that stops reading holds up guest
+// serial output, and so the log, until it reads again or disconnects: QEMU keeps the emulated UART busy until the
+// socket is writable (serial_xmit in https://github.com/qemu/qemu/blob/v11.1.0/hw/char/serial.c).
 func (r *openVMMSerialRelay) Write(data []byte) (int, error) {
+	// The lock only snapshots the current console; the write itself happens outside it.
 	r.mutex.Lock()
 	client := r.client
 	r.mutex.Unlock()
 	if client != nil {
-		_, _ = dropWhenFullWriter{conn: client}.Write(data)
-	}
-	return len(data), nil
-}
-
-// dropWhenFullWriter sends only what the peer's socket buffer can take and discards the rest, so a peer that stops
-// reading never blocks the relay. Unlike QEMU, which stalls the guest's UART until the console reads again, this keeps
-// guest output flowing to the log; the stalled console loses the overflow but stays connected.
-type dropWhenFullWriter struct {
-	conn net.Conn
-}
-
-func (w dropWhenFullWriter) Write(data []byte) (int, error) {
-	if raw, err := w.conn.(syscall.Conn).SyscallConn(); err == nil {
-		_ = raw.Write(func(fd uintptr) bool {
-			_, _ = unix.SendmsgN(int(fd), data, nil, nil, unix.MSG_DONTWAIT)
-			return true
-		})
+		_, _ = client.Write(data)
 	}
 	return len(data), nil
 }

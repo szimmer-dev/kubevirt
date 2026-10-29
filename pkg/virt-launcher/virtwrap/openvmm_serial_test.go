@@ -180,43 +180,24 @@ var _ = Describe("OpenVMM serial relay", func() {
 		Expect(err).To(MatchError(os.ErrNotExist), "stopping the relay should remove the virt-serial0 socket")
 	})
 
-	It("drops overflow instead of blocking when a peer stops reading", func() {
+	It("holds up guest output for a console that stops reading without losing any, as KVM does", func() {
 		p := newPaths()
 		_, vmm := startRelay(p, p.log)
-		// Far larger than a Unix socket buffer, so a peer that stops reading cannot take all of it.
+		// Far larger than a Unix socket buffer, so the guest's writes must wait for the console to read.
 		bulk := strings.Repeat("z", 1024*1024)
 
-		drain := func(conn net.Conn) int {
-			total := 0
-			for {
-				Expect(conn.SetReadDeadline(time.Now().Add(200*time.Millisecond))).To(Succeed(), "the connection should accept a read deadline")
-				n, err := conn.Read(make([]byte, 64*1024))
-				total += n
-				if err != nil {
-					Expect(err).To(MatchError(os.ErrDeadlineExceeded), "draining should end only because no more data arrives")
-					return total
-				}
-			}
-		}
-
-		By("logging everything while the console stops reading")
 		console := attachConsole(p, vmm, "x")
-		send(vmm, bulk, "the fake guest should be able to emit a large burst of output")
-		Eventually(func() int { return len(readLog(p.log)()) }).Should(Equal(len(bulk)),
-			"a console that stops reading must not stall logging")
+		guestDone := make(chan error, 1)
+		go func() {
+			_, err := vmm.Write([]byte(bulk))
+			guestDone <- err
+		}()
+		Consistently(guestDone, 300*time.Millisecond).ShouldNot(Receive(),
+			"guest output should wait while the console is not reading")
 
-		By("keeping the stalled console connected and dropping only what did not fit")
-		Expect(drain(console)).To(BeNumerically("<", len(bulk)), "output the stalled console could not buffer should be dropped")
-		send(vmm, "after\n", "the fake guest should emit serial output")
-		expectRead(console, "after\n", "the console should keep receiving output once it reads again")
-		Expect(console.Close()).To(Succeed(), "the console should disconnect cleanly")
-
-		By("serving the next console after one sent more input than the guest read")
-		stuck := dialConsole(p)
-		send(stuck, bulk, "unread input should be accepted rather than block the console")
-		Expect(stuck.Close()).To(Succeed(), "the console should disconnect cleanly")
-		Expect(drain(vmm)).To(BeNumerically("<", len(bulk)), "input the guest could not buffer should be dropped")
-		attachConsole(p, vmm, "next\n")
+		expectRead(console, bulk, "the console should receive every byte once it reads again")
+		Eventually(guestDone).Should(Receive(BeNil()), "guest output should resume once the console reads")
+		Eventually(func() int { return len(readLog(p.log)()) }).Should(Equal(len(bulk)), "the log should hold every byte")
 	})
 	It("rotates the log like virtlogd, keeping a bounded number of readable backups", func() {
 		dir := GinkgoT().TempDir()
